@@ -1,30 +1,24 @@
 const express = require('express');
-const supabase = require('../lib/supabase');
+const pool = require('../lib/db');
 
-const router = express.Router();
+const router = require('../lib/asyncRouter')();
 
 // Public listing — never select password here.
 router.get('/', async (req, res) => {
-  const { data, error } = await supabase.from('users').select('id, full_name');
-  if (error) return res.status(400).json({ error: error.message });
-  res.json(data);
+  const [rows] = await pool.query('SELECT id, full_name FROM users');
+  res.json(rows);
 });
 
 router.get('/:id', async (req, res) => {
-  const { data, error } = await supabase
-    .from('users')
-    .select('id, full_name')
-    .eq('id', req.params.id)
-    .single();
-  if (error) return res.status(404).json({ error: error.message });
-  res.json(data);
+  const [rows] = await pool.query('SELECT id, full_name FROM users WHERE id = ?', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'not found' });
+  res.json(rows[0]);
 });
 
 // Total points across every activity (anchor + children) for one user.
 router.get('/:id/points', async (req, res) => {
-  const { data, error } = await supabase.from('activities').select('points').eq('user_id', req.params.id);
-  if (error) return res.status(400).json({ error: error.message });
-  const total = data.reduce((sum, a) => sum + (a.points || 0), 0);
+  const [rows] = await pool.query('SELECT points FROM activities WHERE user_id = ?', [req.params.id]);
+  const total = rows.reduce((sum, a) => sum + (a.points || 0), 0);
   res.json({ points: total });
 });
 
@@ -37,12 +31,8 @@ router.post('/login', async (req, res) => {
   }
   const name = full_name.trim();
 
-  const { data: existing, error } = await supabase
-    .from('users')
-    .select('id, full_name, password')
-    .eq('full_name', name)
-    .maybeSingle();
-  if (error) return res.status(400).json({ error: error.message });
+  const [rows] = await pool.query('SELECT id, full_name, password FROM users WHERE full_name = ? LIMIT 1', [name]);
+  const existing = rows[0];
   if (!existing || existing.password !== password) {
     return res.status(401).json({ error: 'Nama atau kata sandi salah.' });
   }

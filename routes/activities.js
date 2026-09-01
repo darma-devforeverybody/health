@@ -1,8 +1,11 @@
 const express = require("express");
+const crypto = require("crypto");
+const pool = require("../lib/db");
 const supabase = require("../lib/supabase");
 const VALID_CATEGORIES = require("../lib/categories");
+const { attachRelations } = require("../lib/activityRelations");
 
-const router = express.Router();
+const router = require('../lib/asyncRouter')();
 
 router.get("/", async (req, res) => {
 	const { user_id, limit = "12", offset = "0" } = req.query;
@@ -11,30 +14,28 @@ router.get("/", async (req, res) => {
 	const pageOffset = Math.max(Number(offset) || 0, 0);
 	const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-	let query = supabase
-		.from("activities")
-		.select("*, photos(*), users(full_name), children:activities!parent_id(*, photos(*))", {
-			count: "exact",
-		})
-		.is("parent_id", null)
-		.gte("created_at", oneWeekAgo.toISOString())
-		.order("created_at", { ascending: false })
-		.range(pageOffset, pageOffset + pageSize - 1);
-	if (user_id) query = query.eq("user_id", user_id);
+	const where = ["parent_id IS NULL", "created_at >= ?"];
+	const params = [oneWeekAgo];
+	if (user_id) {
+		where.push("user_id = ?");
+		params.push(user_id);
+	}
+	const whereSql = where.join(" AND ");
 
-	const { data, error, count } = await query;
-	if (error) return res.status(400).json({ error: error.message });
+	const [[{ count }]] = await pool.query(`SELECT COUNT(*) as count FROM activities WHERE ${whereSql}`, params);
+	const [rows] = await pool.query(
+		`SELECT * FROM activities WHERE ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+		[...params, pageSize, pageOffset]
+	);
+	const data = await attachRelations(rows, { withAuthor: true });
 	res.json({ data, count, limit: pageSize, offset: pageOffset });
 });
 
 router.get("/:id", async (req, res) => {
-	const { data, error } = await supabase
-		.from("activities")
-		.select("*, photos(*), children:activities!parent_id(*, photos(*))")
-		.eq("id", req.params.id)
-		.single();
-	if (error) return res.status(404).json({ error: error.message });
-	res.json(data);
+	const [rows] = await pool.query("SELECT * FROM activities WHERE id = ?", [req.params.id]);
+	if (!rows[0]) return res.status(404).json({ error: "not found" });
+	const [enriched] = await attachRelations(rows);
+	res.json(enriched);
 });
 
 router.post("/", async (req, res) => {
@@ -56,28 +57,22 @@ router.post("/", async (req, res) => {
 	if (!parent_id) {
 		const startOfDay = new Date();
 		startOfDay.setHours(0, 0, 0, 0);
-		const { count, error: countError } = await supabase
-			.from("activities")
-			.select("id", { count: "exact", head: true })
-			.eq("user_id", user_id)
-			.is("parent_id", null)
-			.gte("created_at", startOfDay.toISOString());
-		if (countError) return res.status(400).json({ error: countError.message });
+		const [[{ count }]] = await pool.query(
+			"SELECT COUNT(*) as count FROM activities WHERE user_id = ? AND parent_id IS NULL AND created_at >= ?",
+			[user_id, startOfDay]
+		);
 		if (count > 0) {
 			return res.status(409).json({ error: "Kamu sudah memposting hari ini. Coba lagi besok." });
 		}
 	}
 
-	const insertData = { user_id, category, caption };
-	if (parent_id) insertData.parent_id = parent_id;
-
-	const { data, error } = await supabase
-		.from("activities")
-		.insert(insertData)
-		.select()
-		.single();
-	if (error) return res.status(400).json({ error: error.message });
-	res.status(201).json(data);
+	const id = crypto.randomUUID();
+	await pool.query(
+		"INSERT INTO activities (id, user_id, category, caption, parent_id) VALUES (?, ?, ?, ?, ?)",
+		[id, user_id, category, caption ?? null, parent_id ?? null]
+	);
+	const [rows] = await pool.query("SELECT * FROM activities WHERE id = ?", [id]);
+	res.status(201).json(rows[0]);
 });
 
 router.put("/:id", async (req, res) => {
@@ -90,32 +85,33 @@ router.put("/:id", async (req, res) => {
 			});
 	}
 
-	const { data: existing, error: findError } = await supabase
-		.from("activities")
-		.select("points")
-		.eq("id", req.params.id)
-		.single();
-	if (findError) return res.status(404).json({ error: findError.message });
+	const [existingRows] = await pool.query("SELECT points FROM activities WHERE id = ?", [req.params.id]);
+	if (!existingRows[0]) return res.status(404).json({ error: "not found" });
 
 	// Same rule as delete — once admin has scored it, the record is locked.
-	if (existing.points > 0) {
+	if (existingRows[0].points > 0) {
 		return res.status(400).json({
 			error: "Aktivitas ini sudah diberi poin dan tidak bisa diubah.",
 		});
 	}
 
-	const update = {};
-	if (category) update.category = category;
-	if (caption !== undefined) update.caption = caption;
+	const sets = [];
+	const params = [];
+	if (category) {
+		sets.push("category = ?");
+		params.push(category);
+	}
+	if (caption !== undefined) {
+		sets.push("caption = ?");
+		params.push(caption);
+	}
+	if (sets.length > 0) {
+		params.push(req.params.id);
+		await pool.query(`UPDATE activities SET ${sets.join(", ")} WHERE id = ?`, params);
+	}
 
-	const { data, error } = await supabase
-		.from("activities")
-		.update(update)
-		.eq("id", req.params.id)
-		.select()
-		.single();
-	if (error) return res.status(400).json({ error: error.message });
-	res.json(data);
+	const [rows] = await pool.query("SELECT * FROM activities WHERE id = ?", [req.params.id]);
+	res.json(rows[0]);
 });
 
 async function removeStorageFolder(activityId) {
@@ -131,12 +127,12 @@ async function removeStorageFolder(activityId) {
 router.delete("/:id", async (req, res) => {
 	const activityId = req.params.id;
 
-	const { data: activity, error: fetchError } = await supabase
-		.from("activities")
-		.select("id, parent_id, category, points")
-		.eq("id", activityId)
-		.single();
-	if (fetchError) return res.status(404).json({ error: fetchError.message });
+	const [activityRows] = await pool.query(
+		"SELECT id, parent_id, category, points FROM activities WHERE id = ?",
+		[activityId]
+	);
+	const activity = activityRows[0];
+	if (!activity) return res.status(404).json({ error: "not found" });
 
 	// A child category can be removed on its own (editing a submission), as
 	// long as it isn't the mandatory mindful nutrition companion and isn't
@@ -154,19 +150,15 @@ router.delete("/:id", async (req, res) => {
 			});
 		}
 		await removeStorageFolder(activityId);
-		const { error } = await supabase.from("activities").delete().eq("id", activityId);
-		if (error) return res.status(400).json({ error: error.message });
+		await pool.query("DELETE FROM activities WHERE id = ?", [activityId]);
 		return res.status(204).send();
 	}
 
-	const { data: children } = await supabase
-		.from("activities")
-		.select("id, points")
-		.eq("parent_id", activityId);
+	const [children] = await pool.query("SELECT id, points FROM activities WHERE parent_id = ?", [activityId]);
 
 	// Once the admin has awarded points anywhere in this submission, it's locked
 	// from deletion — otherwise a user could erase the record behind the points.
-	if (activity.points > 0 || (children || []).some((c) => c.points > 0)) {
+	if (activity.points > 0 || children.some((c) => c.points > 0)) {
 		return res.status(400).json({
 			error: "Aktivitas ini sudah diberi poin dan tidak bisa dihapus.",
 		});
@@ -176,15 +168,13 @@ router.delete("/:id", async (req, res) => {
 	// (see routes/photos.js upload path) — remove the actual files first,
 	// otherwise deleting the rows just orphans them in the bucket forever.
 	await removeStorageFolder(activityId);
-	for (const child of children || []) {
+	for (const child of children) {
 		await removeStorageFolder(child.id);
 	}
 
-	const { error } = await supabase
-		.from("activities")
-		.delete()
-		.eq("id", activityId);
-	if (error) return res.status(400).json({ error: error.message });
+	// Children (and every photo row, via its own FK) cascade-delete in MySQL
+	// once the anchor row is gone — see activities_parent_id_fkey / photos_activity_id_fkey.
+	await pool.query("DELETE FROM activities WHERE id = ?", [activityId]);
 	res.status(204).send();
 });
 

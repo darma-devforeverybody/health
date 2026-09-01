@@ -1,19 +1,19 @@
 const express = require('express');
 const multer = require('multer');
 const supabase = require('../lib/supabase');
+const pool = require('../lib/db');
+const crypto = require('crypto');
 
-const router = express.Router();
+const router = require('../lib/asyncRouter')();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
 const IMAGE_API_BASE = `${process.env.IMAGE_API_ORIGIN}/image_ricola/api/image`;
 
 router.get('/', async (req, res) => {
   const { activity_id } = req.query;
-  let query = supabase.from('photos').select('*');
-  if (activity_id) query = query.eq('activity_id', activity_id);
-
-  const { data, error } = await query;
-  if (error) return res.status(400).json({ error: error.message });
-  res.json(data);
+  const [rows] = activity_id
+    ? await pool.query('SELECT * FROM photos WHERE activity_id = ?', [activity_id])
+    : await pool.query('SELECT * FROM photos');
+  res.json(rows);
 });
 
 // Issue a signed upload URL so the browser can upload the file straight to
@@ -81,39 +81,32 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'activity_id and url required' });
   }
 
-  const { data: activity, error: findError } = await supabase
-    .from('activities')
-    .select('points')
-    .eq('id', activity_id)
-    .single();
-  if (findError) return res.status(404).json({ error: findError.message });
+  const [activityRows] = await pool.query('SELECT points FROM activities WHERE id = ?', [activity_id]);
+  if (!activityRows[0]) return res.status(404).json({ error: 'not found' });
   // Same rule as editing the activity itself — once scored, it's locked.
-  if (activity.points > 0) {
+  if (activityRows[0].points > 0) {
     return res.status(400).json({ error: 'Aktivitas ini sudah diberi poin dan tidak bisa diubah.' });
   }
 
-  const { data, error } = await supabase
-    .from('photos')
-    .insert({ activity_id, url })
-    .select()
-    .single();
-  if (error) return res.status(400).json({ error: error.message });
-  res.status(201).json(data);
+  const id = crypto.randomUUID();
+  await pool.query('INSERT INTO photos (id, activity_id, url) VALUES (?, ?, ?)', [id, activity_id, url]);
+  const [rows] = await pool.query('SELECT * FROM photos WHERE id = ?', [id]);
+  res.status(201).json(rows[0]);
 });
 
 router.delete('/:id', async (req, res) => {
-  const { data: photo, error: findError } = await supabase
-    .from('photos')
-    .select('activity_id, activities(points)')
-    .eq('id', req.params.id)
-    .single();
-  if (findError) return res.status(404).json({ error: findError.message });
-  if (photo.activities?.points > 0) {
+  const [rows] = await pool.query(
+    `SELECT photos.activity_id, activities.points
+     FROM photos JOIN activities ON activities.id = photos.activity_id
+     WHERE photos.id = ?`,
+    [req.params.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'not found' });
+  if (rows[0].points > 0) {
     return res.status(400).json({ error: 'Aktivitas ini sudah diberi poin dan tidak bisa diubah.' });
   }
 
-  const { error } = await supabase.from('photos').delete().eq('id', req.params.id);
-  if (error) return res.status(400).json({ error: error.message });
+  await pool.query('DELETE FROM photos WHERE id = ?', [req.params.id]);
   res.status(204).send();
 });
 

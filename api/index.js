@@ -32,6 +32,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// Mirrors the old Supabase {data,error} behavior — a DB/route error becomes
+// a 400 JSON response instead of an unhandled rejection that kills the process.
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(400).json({ error: err.message });
+});
+
 // Local dev convenience: serve the built React app from this same process.
 // In production on Vercel, static files and SPA fallback are handled by
 // vercel.json (outputDirectory + rewrites) before requests ever reach this function.
